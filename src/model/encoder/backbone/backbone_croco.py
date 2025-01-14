@@ -57,6 +57,11 @@ class BackboneCrocoCfg:
     intrinsics_embed_degree: int = 0
     intrinsics_embed_type: Literal["pixelwise", "linear", "token"] = 'token'  # linear or dpt
 
+    #extrinsics
+    extrinsics_embed_loc: Literal["encoder", "decoder", "none"] = 'none'
+    extrinsics_embed_degree: int = 0
+    extrinsics_embed_type: Literal["linear", "token"] = 'token'  # linear or dpt
+
 
 class AsymmetricCroCo(CroCoNet):
     """ Two siamese encoders, followed by two decoders.
@@ -66,11 +71,18 @@ class AsymmetricCroCo(CroCoNet):
 
     def __init__(self, cfg: BackboneCrocoCfg, d_in: int) -> None:
 
+        print("Of course I still use CROCO BACKBONE")
+
         self.intrinsics_embed_loc = cfg.intrinsics_embed_loc
         self.intrinsics_embed_degree = cfg.intrinsics_embed_degree
         self.intrinsics_embed_type = cfg.intrinsics_embed_type
         self.intrinsics_embed_encoder_dim = 0
         self.intrinsics_embed_decoder_dim = 0
+
+        self.extrinsics_embed_loc = cfg.extrinsics_embed_loc
+        self.extrinsics_embed_degree = cfg.extrinsics_embed_degree
+        self.extrinsics_embed_type = cfg.extrinsics_embed_type
+
         if self.intrinsics_embed_loc == 'encoder' and self.intrinsics_embed_type == 'pixelwise':
             self.intrinsics_embed_encoder_dim = (self.intrinsics_embed_degree + 1) ** 2 if self.intrinsics_embed_degree > 0 else 3
         elif self.intrinsics_embed_loc == 'decoder' and self.intrinsics_embed_type == 'pixelwise':
@@ -85,7 +97,10 @@ class AsymmetricCroCo(CroCoNet):
             self.dec_blocks2 = deepcopy(self.dec_blocks)  # This is used in DUSt3R and MASt3R
 
         if self.intrinsics_embed_type == 'linear' or self.intrinsics_embed_type == 'token':
-            self.intrinsic_encoder = nn.Linear(9, 1024)
+            self.intrinsic_encoder = nn.Linear(9, 1024) # fx, fy, cx, cy, k1, k2, p1, p2, k3 or is the 3x3 matrix
+        
+        if self.extrinsics_embed_type == 'linear' or self.extrinsics_embed_type == 'token':
+            self.extrinsic_encoder = nn.Linear(16, 1024) # quaternion + translation, 4 + 3 -> xyzw, + tx,ty,tz (it is actually 4x4 homogeneus matrix)
 
         # self.set_freeze(freeze)
 
@@ -129,7 +144,7 @@ class AsymmetricCroCo(CroCoNet):
         """ No prediction head """
         return
 
-    def _encode_image(self, image, true_shape, intrinsics_embed=None):
+    def _encode_image(self, image, true_shape, intrinsics_embed=None, extrinsics_embed=None):
         # embed the image into patches  (x has size B x Npatches x C)
         x, pos = self.patch_embed(image, true_shape=true_shape)
 
@@ -139,6 +154,17 @@ class AsymmetricCroCo(CroCoNet):
                 x = x + intrinsics_embed
             elif self.intrinsics_embed_type == 'token':
                 x = torch.cat((x, intrinsics_embed), dim=1)
+                add_pose = pos[:, 0:1, :].clone()
+                add_pose[:, :, 0] += (pos[:, -1, 0].unsqueeze(-1) + 1)
+                pos = torch.cat((pos, add_pose), dim=1)
+
+        # adding for extrinsics
+        if extrinsics_embed is not None:
+
+            if self.extrinsics_embed_type == 'linerar':
+                x = x + extrinsics_embed
+            elif self.extrinsics_embed_type == 'token':
+                x = torch.cat((x, extrinsics_embed), dim=1)
                 add_pose = pos[:, 0:1, :].clone()
                 add_pose[:, :, 0] += (pos[:, -1, 0].unsqueeze(-1) + 1)
                 pos = torch.cat((pos, add_pose), dim=1)
@@ -153,11 +179,14 @@ class AsymmetricCroCo(CroCoNet):
         x = self.enc_norm(x)
         return x, pos, None
 
-    def _encode_image_pairs(self, img1, img2, true_shape1, true_shape2, intrinsics_embed1=None, intrinsics_embed2=None):
+    def _encode_image_pairs(self, img1, img2, true_shape1, true_shape2, intrinsics_embed1=None, intrinsics_embed2=None, extrinsics_embed1=None, extrinsics_embed2=None):
+
         if img1.shape[-2:] == img2.shape[-2:]:
             out, pos, _ = self._encode_image(torch.cat((img1, img2), dim=0),
                                              torch.cat((true_shape1, true_shape2), dim=0),
-                                             torch.cat((intrinsics_embed1, intrinsics_embed2), dim=0) if intrinsics_embed1 is not None else None)
+                                             torch.cat((intrinsics_embed1, intrinsics_embed2), dim=0) if intrinsics_embed1 is not None else None,
+                                             torch.cat((extrinsics_embed1, extrinsics_embed2), dim=0) if extrinsics_embed1 is not None else None)
+            
             out, out2 = out.chunk(2, dim=0)
             pos, pos2 = pos.chunk(2, dim=0)
         else:
@@ -177,8 +206,11 @@ class AsymmetricCroCo(CroCoNet):
         intrinsics_embed1 = view1.get('intrinsics_embed', None)
         intrinsics_embed2 = view2.get('intrinsics_embed', None)
 
+        extrinsics_embed1 = view1.get('extrinsics_embed', None)
+        extrinsics_embed2 = view2.get('extrinsics_embed', None)
+
         if force_asym or not is_symmetrized(view1, view2):
-            feat1, feat2, pos1, pos2 = self._encode_image_pairs(img1, img2, shape1, shape2, intrinsics_embed1, intrinsics_embed2)
+            feat1, feat2, pos1, pos2 = self._encode_image_pairs(img1, img2, shape1, shape2, intrinsics_embed1, intrinsics_embed2, extrinsics_embed1, extrinsics_embed2)
         else:
             # computing half of forward pass!'
             feat1, feat2, pos1, pos2 = self._encode_image_pairs(img1[::2], img2[::2], shape1[::2], shape2[::2])
@@ -241,6 +273,11 @@ class AsymmetricCroCo(CroCoNet):
             view1['intrinsics_embed'] = intrinsic_embedding[:, 0].unsqueeze(1)
             view2['intrinsics_embed'] = intrinsic_embedding[:, 1].unsqueeze(1)
 
+        if self.extrinsics_embed_loc == 'encoder' and (self.extrinsics_embed_type == 'token' or self.extrinsics_embed_type == 'linear'):
+            extrinsic_embedding = self.extrinsic_encoder(context["extrinsics"].flatten(2))
+            view1['extrinsics_embed'] = extrinsic_embedding[:, 0].unsqueeze(1)
+            view2['extrinsics_embed'] = extrinsic_embedding[:, 1].unsqueeze(1)
+
         if symmetrize_batch:
             instance_list_view1, instance_list_view2 = [0 for _ in range(b)], [1 for _ in range(b)]
             view1['instance'] = instance_list_view1
@@ -258,11 +295,23 @@ class AsymmetricCroCo(CroCoNet):
         if self.intrinsics_embed_loc == 'decoder':
             # FIXME: downsample is hardcoded to 16
             intrinsic_emb = get_intrinsic_embedding(context, degree=self.intrinsics_embed_degree, downsample=16, merge_hw=True)
-            dec1, dec2 = self._decoder(feat1, pos1, feat2, pos2, intrinsic_emb[:, 0], intrinsic_emb[:, 1])
+
+        if self.extrinsics_embed_loc == 'decoder':
+            pass 
+            # this method, has to be implemented in the future if needed
+            # extrinsic_emb = context["extrinsics"].flatten(2)
+
+            # dec1, dec2 = self._decoder(feat1, pos1, feat2, pos2, intrinsic_emb[:, 0], intrinsic_emb[:, 1])
         else:
             dec1, dec2 = self._decoder(feat1, pos1, feat2, pos2)
 
         if self.intrinsics_embed_loc == 'encoder' and self.intrinsics_embed_type == 'token':
+            dec1, dec2 = list(dec1), list(dec2)
+            for i in range(len(dec1)):
+                dec1[i] = dec1[i][:, :-1]
+                dec2[i] = dec2[i][:, :-1]
+
+        if self.extrinsics_embed_loc == 'encoder' and self.extrinsics_embed_type == 'token':
             dec1, dec2 = list(dec1), list(dec2)
             for i in range(len(dec1)):
                 dec1[i] = dec1[i][:, :-1]
